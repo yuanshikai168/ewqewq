@@ -61,6 +61,26 @@ def init_database():
 
     logger.info("数据库初始化完成")
 
+    # 迁移：为旧数据库添加试用期字段
+    _migrate_trial_fields()
+
+
+def _migrate_trial_fields():
+    """为已存在的 groups 表添加 trial 字段（兼容旧数据库）"""
+    try:
+        db = Database.get_instance()
+        db.execute(
+            "ALTER TABLE groups ADD COLUMN trial_start datetime DEFAULT NULL"
+        )
+    except Exception:
+        pass  # 列已存在
+    try:
+        db.execute(
+            "ALTER TABLE groups ADD COLUMN trial_end datetime DEFAULT NULL"
+        )
+    except Exception:
+        pass  # 列已存在
+
 
 @app.route("/webhook", methods=["POST"])
 async def webhook():

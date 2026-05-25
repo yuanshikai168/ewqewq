@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS `groups` (
     `group_type` varchar(20) DEFAULT 'group',
     `is_active` tinyint(1) DEFAULT 1,
     `accounting_status` tinyint(1) DEFAULT 1,
+    `trial_start` datetime DEFAULT NULL COMMENT '试用开始时间',
+    `trial_end` datetime DEFAULT NULL COMMENT '试用到期时间',
     `created_at` timestamp DEFAULT CURRENT_TIMESTAMP,
     `updated_at` timestamp DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (`id`),

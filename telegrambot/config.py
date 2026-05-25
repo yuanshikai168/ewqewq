@@ -26,6 +26,12 @@ ADMIN_USER_IDS = [int(x) for x in _admin_ids.split(",") if x.strip()] if _admin_
 # 应用地址
 APP_URL = os.getenv("APP_URL", "")
 
+# 管理员联系方式（试用到期后提示用户联系）
+ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@admin")
+
+# 试用天数（默认3天）
+TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", 3))
+
 # 调试模式
 DEBUG = os.getenv("DEBUG_MODE", "false").lower() == "true"
 

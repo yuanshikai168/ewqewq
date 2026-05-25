@@ -11,7 +11,7 @@ from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 
 from database import Database
-from config import ADMIN_USER_IDS, BOT_USERNAME
+from config import ADMIN_USER_IDS, BOT_USERNAME, ADMIN_CONTACT, TRIAL_DAYS
 from accounting import AccountingManager
 from bill_formatter import BillFormatter
 from price_checker import PriceChecker
@@ -68,6 +68,17 @@ class BotHandler:
         if text.startswith("/"):
             await self._route_command(update, context, text, user, group)
         else:
+            # 群组内检查试用期
+            if is_group and group and self._is_trial_expired(group["id"]):
+                if not self._is_trial_related_cmd(text) and user["telegram_id"] not in ADMIN_USER_IDS:
+                    await msg.reply_text(
+                        f"⏰ <b>试用已到期！</b>\n\n"
+                        f"请联系管理员续费：<b>{ADMIN_CONTACT}</b>\n"
+                        f"或发送 <b>查询续费</b> 查看状态",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    return
+
             await self._route_text(update, context, text, user, group, message_id)
 
     async def _route_command(self, update, context, text, user, group):
@@ -91,6 +102,11 @@ class BotHandler:
     async def _route_text(self, update, context, text, user, group, message_id):
         """普通文本路由"""
         chat_id = update.effective_chat.id
+
+        # 续费/试用查询（管理员可操作，普通用户可查询）
+        if self._is_trial_cmd(text):
+            await self._handle_trial(update, context, text, user, group)
+            return
 
         # 币价查询
         if self._is_price_cmd(text):
@@ -460,16 +476,41 @@ class BotHandler:
         self._set_setting(group["id"], "accounting_enabled", "0")
         self._set_setting(group["id"], "setup_completed", "0")
 
+        # 自动激活3天试用
+        now = datetime.now()
+        db.execute(
+            "UPDATE groups SET trial_start=%s, trial_end=%s WHERE id=%s",
+            (now, now + timedelta(days=TRIAL_DAYS), group["id"]),
+        )
+        trial_end_str = (now + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d %H:%M")
+
         msg = ("🤖 <b>记账机器人已加入群组！</b>\n\n"
+               f"🎁 <b>自动领取 {TRIAL_DAYS} 天免费试用</b>\n"
+               f"📅 试用到期：{trial_end_str}\n\n"
                "📋 使用步骤：\n"
                "1️⃣ 输入 <b>开始</b> 激活记账\n"
                "2️⃣ 输入 <b>设置费率X%</b>\n"
                "3️⃣ 输入 <b>设置美元汇率6.5</b>\n\n"
+               f"⚠️ 试用到期后请联系 <b>{ADMIN_CONTACT}</b> 续费\n"
                "📅 默认记账周期：凌晨4点至第二天凌晨4点")
         await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
 
     async def _activate_daily(self, update, context, group):
         chat_id = update.effective_chat.id
+
+        # 检查试用期
+        if self._is_trial_expired(group["id"]):
+            r = db.query_one("SELECT trial_end FROM groups WHERE id=%s", (group["id"],))
+            end_str = r["trial_end"].strftime("%Y-%m-%d %H:%M") if r and r["trial_end"] else "未知"
+            await update.message.reply_text(
+                f"⏰ <b>试用已到期！</b>\n\n"
+                f"到期时间：{end_str}\n"
+                f"请联系管理员续费：<b>{ADMIN_CONTACT}</b>\n\n"
+                f"发送 <b>查询续费</b> 查看状态",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
         now = datetime.now()
         today_4am = now.replace(hour=4, minute=0, second=0, microsecond=0)
 
@@ -584,6 +625,17 @@ class BotHandler:
         lines.append(f"💱 汇率：{exchange_rate}")
         lines.append(f"🔄 汇率来源：{src_map.get(rate_source, rate_source)}")
         lines.append(f"🎨 显示模式：{mode_map.get(display_mode, display_mode)}")
+
+        # 试用/到期信息
+        trial = db.query_one("SELECT trial_start, trial_end FROM groups WHERE id=%s", (group["id"],))
+        if trial and trial["trial_end"]:
+            now = datetime.now()
+            end = trial["trial_end"]
+            if now > end:
+                lines.append(f"⏰ 已过期，请联系 {ADMIN_CONTACT} 续费")
+            else:
+                remaining = end - now
+                lines.append(f"🎁 到期：{end.strftime('%Y-%m-%d')}（剩 {remaining.days} 天）")
 
         custom = db.query("SELECT * FROM custom_rates WHERE group_id=%s ORDER BY rate_name", (group["id"],))
         if custom:
@@ -727,7 +779,8 @@ class BotHandler:
                "🎨 <b>模式</b>：设置为计数模式 / 设置显示模式2\n"
                "💱 <b>币价</b>：lk / lz / lw\n"
                "📌 /set 5 / /gd 6.8 / /usdt\n"
-               "🔄 撤销 / 开始 / 结束记录")
+               "🔄 撤销 / 开始 / 结束记录\n"
+               "⏰ <b>查询续费</b> / <b>我的续费</b>")
         await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
 
     async def _cmd_set_fee(self, update, context, user, group, args):
@@ -769,6 +822,118 @@ class BotHandler:
         lines.append(f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
         await context.bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.HTML)
+
+    # ===================== 试用/续费 =====================
+
+    def _is_trial_cmd(self, text: str) -> bool:
+        """检查是否是试用/续费相关命令"""
+        return text.startswith("续费") or text.startswith("查询续费") or text == "我的续费" or text == "试用状态"
+
+    def _is_trial_related_cmd(self, text: str) -> bool:
+        """试用过期后仍允许的命令"""
+        allowed = {"查询续费", "我的续费", "试用状态", "开始", "开始记账", "/start", "/help"}
+        return text in allowed or text.startswith("续费")
+
+    def _is_trial_expired(self, group_id: int) -> bool:
+        """检查群组试用是否过期"""
+        r = db.query_one("SELECT trial_end FROM groups WHERE id=%s", (group_id,))
+        if not r or not r["trial_end"]:
+            return False
+        return datetime.now() > r["trial_end"]
+
+    async def _handle_trial(self, update, context, text, user, group):
+        """处理试用/续费命令"""
+        chat_id = update.effective_chat.id
+
+        # 查询续费/试用状态
+        if text in ("查询续费", "我的续费", "试用状态"):
+            if group:
+                await self._show_trial_status(update, context, group)
+            else:
+                await update.message.reply_text(
+                    f"ℹ️ 请在群组中使用此命令\n续费请联系管理员：{ADMIN_CONTACT}"
+                )
+            return
+
+        # 续费（仅管理员）
+        if text.startswith("续费"):
+            if user["telegram_id"] not in ADMIN_USER_IDS:
+                await update.message.reply_text(
+                    f"❌ 只有管理员才能续费\n请联系：{ADMIN_CONTACT}"
+                )
+                return
+
+            # 续费X天
+            m = re.match(r"^续费(\d+)天$", text)
+            if m:
+                days = int(m.group(1))
+                await self._renew_group(update, context, group, days)
+            else:
+                await update.message.reply_text(
+                    "❌ 格式：续费30天\n💡 示例：续费30天 / 续费90天 / 续费365天"
+                )
+
+    async def _show_trial_status(self, update, context, group):
+        """显示试用状态"""
+        r = db.query_one("SELECT trial_start, trial_end FROM groups WHERE id=%s", (group["id"],))
+        if not r or not r["trial_end"]:
+            await update.message.reply_text("ℹ️ 暂无使用期限信息")
+            return
+
+        now = datetime.now()
+        end = r["trial_end"]
+        expired = now > end
+
+        if expired:
+            days_ago = (now - end).days
+            msg = (
+                f"<b>⏰ 使用已到期</b>\n"
+                f"━━━━━━━━━━━━━\n"
+                f"到期时间：{end.strftime('%Y-%m-%d %H:%M')}\n"
+                f"已过期：{days_ago} 天\n\n"
+                f"⚠️ 请联系管理员续费：<b>{ADMIN_CONTACT}</b>"
+            )
+        else:
+            remaining = end - now
+            days = remaining.days
+            hours = remaining.seconds // 3600
+            msg = (
+                f"<b>🎁 使用状态</b>\n"
+                f"━━━━━━━━━━━━━\n"
+                f"到期时间：{end.strftime('%Y-%m-%d %H:%M')}\n"
+                f"剩余：<b>{days} 天 {hours} 小时</b>\n"
+                f"状态：✅ 正常使用中"
+            )
+        await context.bot.send_message(update.effective_chat.id, msg, parse_mode=ParseMode.HTML)
+
+    async def _renew_group(self, update, context, group, days: int):
+        """管理员续费"""
+        r = db.query_one("SELECT trial_end FROM groups WHERE id=%s", (group["id"],))
+        now = datetime.now()
+
+        if r and r["trial_end"] and r["trial_end"] > now:
+            # 未到期：从当前到期时间延长
+            new_end = r["trial_end"] + timedelta(days=days)
+        else:
+            # 已到期或首次：从当前时间开始
+            new_end = now + timedelta(days=days)
+
+        db.execute(
+            "UPDATE groups SET trial_end=%s WHERE id=%s",
+            (new_end, group["id"]),
+        )
+
+        # 同步恢复记账状态
+        self._set_setting(group["id"], "accounting_status", True)
+
+        msg = (
+            f"✅ <b>续费成功！</b>\n"
+            f"━━━━━━━━━━━━━\n"
+            f"续费天数：{days} 天\n"
+            f"到期时间：{new_end.strftime('%Y-%m-%d %H:%M')}\n"
+            f"状态：可正常使用"
+        )
+        await context.bot.send_message(update.effective_chat.id, msg, parse_mode=ParseMode.HTML)
 
     # ===================== 辅助方法 =====================
 
@@ -822,10 +987,13 @@ class BotHandler:
     def _get_or_create_group(self, chat) -> dict:
         r = db.query_one("SELECT * FROM groups WHERE telegram_group_id=%s", (chat.id,))
         if not r:
+            now = datetime.now()
             gid = db.insert("groups", {
                 "telegram_group_id": chat.id,
                 "group_name": chat.title or "",
                 "group_type": chat.type,
+                "trial_start": now,
+                "trial_end": now + timedelta(days=TRIAL_DAYS),
             })
             r = db.query_one("SELECT * FROM groups WHERE id=%s", (gid,))
         else:
